@@ -278,8 +278,7 @@ pip install -r requirements.txt
 Create a `.env` file in the project root directory with the following variables:
 
 ```env
-# LLM API Keys
-GROQ_API_KEY=your_groq_api_key_here
+# LLM API Key
 OPENAI_API_KEY=your_openai_api_key_here
 
 # External Search
@@ -290,8 +289,7 @@ PINECONE_API_KEY=your_pinecone_api_key_here
 PINECONE_INDEX_NAME=fde-it-support-rag
 PINECONE_NAMESPACE=company-it-kb
 
-# LLM Models
-GROQ_MODEL=openai/gpt-oss-20b
+# Models
 OPENAI_MODEL=gpt-4o-mini
 EMBEDDING_MODEL=text-embedding-3-small
 
@@ -306,13 +304,11 @@ APP_ENV=development
 
 | Variable | Description | Example | Required |
 |---|---|---|---|
-| `GROQ_API_KEY` | API key for Groq LLM (routing, grading, generation) | `gsk_...` | ✅ Yes |
-| `OPENAI_API_KEY` | API key for OpenAI (embeddings and fallback LLM) | `sk-...` | ✅ Yes |
-| `TAVILY_API_KEY` | API key for Tavily web search | `tvly-...` | ✅ Yes |
-| `PINECONE_API_KEY` | API key for Pinecone vector database | `pckey-...` | ✅ Yes |
+| `OPENAI_API_KEY` | API key for chat and embeddings | `sk-...` | Needed for chat and retrieval |
+| `TAVILY_API_KEY` | API key for external web search fallback | `tvly-...` | Needed only for web fallback |
+| `PINECONE_API_KEY` | API key for Pinecone private knowledge retrieval | `pckey-...` | Needed for retrieval |
 | `PINECONE_INDEX_NAME` | Pinecone index name | `fde-it-support-rag` | ⚠️ Optional (default: `fde-it-support-rag`) |
 | `PINECONE_NAMESPACE` | Pinecone namespace for document isolation | `company-it-kb` | ⚠️ Optional (default: `company-it-kb`) |
-| `GROQ_MODEL` | Groq model identifier | `openai/gpt-oss-20b` | ⚠️ Optional (default: `openai/gpt-oss-20b`) |
 | `OPENAI_MODEL` | OpenAI model identifier | `gpt-4o-mini` | ⚠️ Optional (default: `gpt-4o-mini`) |
 | `EMBEDDING_MODEL` | Embedding model for vectorization | `text-embedding-3-small` | ⚠️ Optional (default: `text-embedding-3-small`) |
 | `ADMIN_API_KEY` | Secret key for admin endpoints (document ingestion) | `your-secure-key` | ⚠️ Optional (default: `change-me`) |
@@ -347,14 +343,24 @@ Pinecone Vector Database
 
 ### Step 5 — Run the application
 
+On Windows, from the project root:
+
 ```bash
-python run.py
+py -3.11 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe run.py
 ```
 
-Open:
+Create and configure the project-root `.env` file before asking questions. The app uses
+`OPENAI_API_KEY` for chat and embeddings, `PINECONE_API_KEY` for private knowledge
+retrieval, and `TAVILY_API_KEY` when it needs external search. The home page and health
+check can run without those service calls.
+
+Open the app and check the health endpoint:
 
 ```text
 http://127.0.0.1:8000
+http://127.0.0.1:8000/api/health
 ```
 
 FastAPI API docs:
@@ -362,6 +368,16 @@ FastAPI API docs:
 ```text
 http://127.0.0.1:8000/docs
 ```
+
+If port 8000 is already in use, stop the other server with `Ctrl+C`, or choose another
+port in PowerShell before starting the app:
+
+```powershell
+$env:PORT = "8001"
+.\.venv\Scripts\python.exe run.py
+```
+
+Then use `http://127.0.0.1:8001`. Stop the server with `Ctrl+C`.
 
 ---
 

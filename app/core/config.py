@@ -10,7 +10,7 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     tavily_api_key: str = ""
     pinecone_api_key: str = ""
-    pinecone_index_name: str = "industry-agentic-rag-kb"
+    pinecone_index_name: str = "industry-agentic-rag-kb-v2"
     pinecone_namespace: str = "langgraph-agentic-rag"
     embedding_model: str = "text-embedding-3-small"
     openai_model: str = "gpt-4o-mini"
