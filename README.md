@@ -1,7 +1,7 @@
 # Enterprise-IT-Support-AI-Copilot
 
 
-An end-to-end **Forward Deployed Engineer (FDE) project** that turns a notebook-style Agentic RAG workflow into a deployable internal product using **LangGraph, FastAPI, Pinecone, Groq, Tavily, HTML, CSS, and JavaScript**.
+An end-to-end **Forward Deployed Engineer (FDE) project** that turns a notebook-style Agentic RAG workflow into a deployable internal product using **LangGraph, FastAPI, Pinecone, OpenAI, Tavily, HTML, CSS, and JavaScript**.
 
 ---
 
@@ -112,7 +112,7 @@ This repository demonstrates each layer.
                └──────────────┬──────────────┘
                               ▼
                      ┌────────────────┐
-                     │ Groq LLM       │
+                     │ OpenAI LLM       │
                      │ Grounded Answer│
                      └────────────────┘
 ```
@@ -186,8 +186,9 @@ The system therefore controls **what to do next** based on its current state.
 | Layer | Technology | Purpose |
 |---|---|---|
 | Agent workflow | LangGraph | Stateful routing and conditional decisions |
-| LLM | Groq | Routing, grading, rewriting, answer generation |
-| Embeddings | HuggingFace `all-MiniLM-L6-v2` | Local 384-dimensional embeddings |
+| Retrieval | Pinecone + SQLite FTS5 | Dense and keyword candidates, fused and lexically reranked |
+| Tracing | Langfuse (optional) | LangGraph callback traces when explicitly enabled |
+| LLM and embeddings | OpenAI via LangChain integrations | Routing, grading, rewriting, answer generation, and vector embeddings |
 | Vector DB | Pinecone | Private enterprise knowledge base |
 | External search | Tavily | Fallback when company KB is insufficient |
 | API | FastAPI | Backend and REST endpoints |
@@ -200,21 +201,23 @@ The system therefore controls **what to do next** based on its current state.
 ## 6. Project Structure
 
 ```text
-FDE_Agentic_RAG_IT_Copilot/
+Enterprise-IT-Support-AI-Copilot/
 │
 ├── app/
 │   ├── api/
-│   │   └── routes.py              # Chat, health and ingestion APIs
+│   │   └── routes.py              # Chat, SSE, health and ingestion APIs
 │   │
 │   ├── core/
 │   │   ├── config.py              # Environment configuration
 │   │   └── logging.py             # Logging configuration
 │   │
 │   ├── rag/
+│   │   ├── retrieval.py           # SQLite FTS5, fusion and lexical reranking
 │   │   ├── state.py               # LangGraph state + structured decisions
 │   │   ├── vectorstore.py         # Pinecone + embeddings
 │   │   └── workflow.py            # Complete Agentic RAG graph
 │   │
+│   ├── evaluation.py              # Expected-source/term evaluation CLI
 │   ├── services/
 │   │   ├── audit.py               # SQLite query audit
 │   │   └── ingestion.py           # PDF/TXT/MD/DOCX loading + chunking
@@ -222,6 +225,8 @@ FDE_Agentic_RAG_IT_Copilot/
 │   └── main.py                    # FastAPI application
 │
 ├── data/
+│   ├── evaluations/
+│   │   └── stage2.jsonl
 │   └── sample_kb/
 │       ├── company_it_handbook.md
 │       └── service_desk_runbook.md
@@ -234,12 +239,14 @@ FDE_Agentic_RAG_IT_Copilot/
 │   └── index.html
 │
 ├── tests/
-│   └── test_ingestion.py
+|   |-- test_ingestion.py
+|   |-- test_security.py
+|   `-- test_vectorstore.py
 │
 ├── uploads/
-├── .env.example
 ├── Dockerfile
 ├── ingest_sample_kb.py
+├── build_local_search_index.py
 ├── requirements.txt
 ├── run.py
 └── README.md
@@ -286,15 +293,28 @@ TAVILY_API_KEY=your_tavily_api_key_here
 
 # Vector Database (Pinecone)
 PINECONE_API_KEY=your_pinecone_api_key_here
-PINECONE_INDEX_NAME=fde-it-support-rag
-PINECONE_NAMESPACE=company-it-kb
+PINECONE_INDEX_NAME=industry-agentic-rag-kb-v2
+PINECONE_NAMESPACE=langgraph-agentic-rag
 
 # Models
 OPENAI_MODEL=gpt-4o-mini
 EMBEDDING_MODEL=text-embedding-3-small
 
 # Security
-ADMIN_API_KEY=change-me-in-production
+ADMIN_API_KEY=
+
+# Upload limit in bytes (default 10 MiB)
+MAX_UPLOAD_SIZE_BYTES=10485760
+
+# Retrieval (SQLite FTS5 keyword + Pinecone dense fusion)
+HYBRID_RETRIEVAL_ENABLED=true
+RETRIEVAL_CANDIDATE_K=12
+
+# Optional Langfuse tracing (opt in; prompts and retrieved text are traced)
+LANGFUSE_ENABLED=false
+LANGFUSE_PUBLIC_KEY=
+LANGFUSE_SECRET_KEY=
+LANGFUSE_BASE_URL=
 
 # Application Settings
 APP_ENV=development
@@ -307,17 +327,30 @@ APP_ENV=development
 | `OPENAI_API_KEY` | API key for chat and embeddings | `sk-...` | Needed for chat and retrieval |
 | `TAVILY_API_KEY` | API key for external web search fallback | `tvly-...` | Needed only for web fallback |
 | `PINECONE_API_KEY` | API key for Pinecone private knowledge retrieval | `pckey-...` | Needed for retrieval |
-| `PINECONE_INDEX_NAME` | Pinecone index name | `fde-it-support-rag` | ⚠️ Optional (default: `fde-it-support-rag`) |
-| `PINECONE_NAMESPACE` | Pinecone namespace for document isolation | `company-it-kb` | ⚠️ Optional (default: `company-it-kb`) |
+| `PINECONE_INDEX_NAME` | Pinecone index name | `industry-agentic-rag-kb-v2` | Optional (default: `industry-agentic-rag-kb-v2`) |
+| `PINECONE_NAMESPACE` | Pinecone namespace for document isolation | `langgraph-agentic-rag` | Optional (default: `langgraph-agentic-rag`) |
 | `OPENAI_MODEL` | OpenAI model identifier | `gpt-4o-mini` | ⚠️ Optional (default: `gpt-4o-mini`) |
 | `EMBEDDING_MODEL` | Embedding model for vectorization | `text-embedding-3-small` | ⚠️ Optional (default: `text-embedding-3-small`) |
-| `ADMIN_API_KEY` | Secret key for admin endpoints (document ingestion) | `your-secure-key` | ⚠️ Optional (default: `change-me`) |
-| `APP_ENV` | Application environment | `development` or `production` | ⚠️ Optional (default: `development`) |
+| `ADMIN_API_KEY` | Secret key for document ingestion | Long random secret | Required to enable ingestion; required (32+ characters) in production |
+| `APP_ENV` | Application environment | `development` or `production` | Optional (default: `development`) |
+| `MAX_UPLOAD_SIZE_BYTES` | Maximum uploaded document size | `10485760` | Optional (default: 10 MiB) |
+| `TOP_K` | Number of private KB chunks retrieved | `4` | Optional (default: `4`) |
+| `MAX_RETRIES` | Maximum web fallback rewrite retries | `1` | Optional (default: `1`) |
+| `AUDIT_DB_PATH` | SQLite audit and ingestion metadata database | `data/audit.db` | Optional (default: project `data/audit.db`) |
+| `UPLOAD_DIR` | Local storage directory for uploaded files | `uploads` | Optional (default: project `uploads`) |
+| `SAMPLE_KB_DIR` | Folder used by the sample ingestion script | `data/sample_kb` | Optional (default: project `data/sample_kb`) |
+| `HYBRID_RETRIEVAL_ENABLED` | Enable dense + SQLite FTS5 retrieval and fusion | `true` | Optional (default: `true`) |
+| `RETRIEVAL_CANDIDATE_K` | Dense/keyword candidates considered before reranking | `12` | Optional (must be at least `TOP_K`) |
+| `LANGFUSE_ENABLED` | Enable optional LangGraph tracing | `false` | Optional (default: disabled) |
+| `LANGFUSE_PUBLIC_KEY` | Langfuse project public key | Secret-managed value | Required only when tracing is enabled |
+| `LANGFUSE_SECRET_KEY` | Langfuse project secret key | Secret-managed value | Required only when tracing is enabled |
+| `LANGFUSE_BASE_URL` | Langfuse endpoint/region URL | `https://cloud.langfuse.com` | Optional; use your self-hosted or regional URL as needed |
 
 **⚠️ Important Security Notes:**
 
 - Never commit `.env` to version control. Add it to `.gitignore`.
-- Change `ADMIN_API_KEY` to a secure random value in production.
+- In development, the app and chat can start without `ADMIN_API_KEY`, but `/api/ingest` returns `503` until a key is configured.
+- In production (`APP_ENV=production`), startup fails unless `ADMIN_API_KEY` has at least 32 characters. Use a secret manager or environment variable.
 - Use environment variables instead of hardcoding secrets.
 - Restrict API key access to only the services that need them.
 
@@ -336,7 +369,7 @@ Load Documents
    ↓
 Chunk Text
    ↓
-HuggingFace Embeddings
+OpenAI Embeddings
    ↓
 Pinecone Vector Database
 ```
@@ -354,7 +387,7 @@ py -3.11 -m venv .venv
 Create and configure the project-root `.env` file before asking questions. The app uses
 `OPENAI_API_KEY` for chat and embeddings, `PINECONE_API_KEY` for private knowledge
 retrieval, and `TAVILY_API_KEY` when it needs external search. The home page and health
-check can run without those service calls.
+check can run without those service calls. Hybrid retrieval uses a local SQLite FTS5 index alongside Pinecone; newly ingested chunks populate it automatically. Re-uploading an already completed document backfills the local index without re-embedding it.
 
 Open the app and check the health endpoint:
 
@@ -487,7 +520,7 @@ Teaching point:
 
 The sidebar contains **Add Company Document**.
 
-Use the `ADMIN_API_KEY` from `.env`.
+Set `ADMIN_API_KEY` in the project-root `.env` before uploading; local development without it leaves ingestion disabled.
 
 Upload one of:
 
@@ -550,11 +583,40 @@ Response contains:
 }
 ```
 
+### `POST /api/chat/stream`
+
+Uses the same JSON request as `/api/chat` and returns Server-Sent Events (`text/event-stream`). Events contain answer `token` values followed by a `complete` event with the source, citations, trace, and rewritten query. The existing JSON `/api/chat` contract remains available.
+
 ### `POST /api/ingest`
 
 Protected by the `X-Admin-Key` request header.
 
-Uploads a document and adds its chunks to Pinecone.
+Uploads a document and adds its chunks to Pinecone. The API accepts PDF, TXT, MD, and DOCX files up to `MAX_UPLOAD_SIZE_BYTES` (10 MiB by default). It returns a stable `document_id` and ingestion `status`; identical content is reported as a duplicate, while changed content is ingested as a separate document. Files are stored under generated names, not the client-provided path.
 
 ---
 
+
+
+### Tests
+
+Run the unit suite without live OpenAI, Pinecone, or Tavily credentials:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+The prompt-injection test checks that retrieved text is explicitly framed as untrusted evidence in the model prompt. It does not prove that a language model will always resist every injection; the test uses a mocked model and makes no such guarantee.
+
+
+### Evaluation harness
+
+`data/evaluations/stage2.jsonl` contains small expected-source and expected-term examples based on the sample KB. Run the harness after configuring the OpenAI and Pinecone credentials and loading the sample KB:
+
+```bash
+python -m app.evaluation
+python -m app.evaluation --output artifacts/evaluations/run.json
+```
+
+If your Pinecone index already contains the sample vectors from before Stage 2, run `python build_local_search_index.py` to build the local lexical index from sample/upload files without embedding or changing Pinecone vectors. The runner makes live workflow calls and can incur provider usage; it is not a fully offline or model-judged evaluation. It reports expected-source accuracy, answer expected-term recall, citation rate, and latency. The small fixture is a smoke/regression set, not a statistically representative benchmark.
+
+Langfuse tracing is optional and disabled by default. When enabled, traces can include prompts and retrieved document text; configure project keys and a data-residency appropriate base URL only if that data flow is approved for your environment.

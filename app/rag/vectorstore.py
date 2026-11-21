@@ -3,6 +3,7 @@ from pinecone import Pinecone , ServerlessSpec
 from langchain_openai import OpenAIEmbeddings
 from langchain_pinecone import PineconeVectorStore
 from app.core.config import get_settings
+from app.rag.retrieval import index_chunks, stable_chunk_id
 
 settings = get_settings()
 
@@ -110,10 +111,23 @@ def get_vectorstore():
 
 
 def get_retriever():
-    return get_vectorstore().as_retriever(search_kwargs={"k": settings.top_k})
+    candidate_k = settings.retrieval_candidate_k if settings.hybrid_retrieval_enabled else settings.top_k
+    return get_vectorstore().as_retriever(search_kwargs={"k": candidate_k})
 
 
 
-def add_documents(chunks):
+def add_documents(chunks, ids: list[str] | None = None):
     store = get_vectorstore()
-    return store.add_documents(chunks)
+    chunks = list(chunks)
+    document_ids = ids or [stable_chunk_id(chunk, index) for index, chunk in enumerate(chunks)]
+    if len(document_ids) != len(chunks):
+        raise ValueError("Document IDs must match the number of chunks")
+    for chunk_id, chunk in zip(document_ids, chunks, strict=True):
+        chunk.metadata["_search_id"] = chunk_id
+    stored_ids = store.add_documents(chunks, ids=document_ids)
+    try:
+        index_chunks(chunks, document_ids)
+    except Exception:
+        import logging
+        logging.getLogger(__name__).exception("Local keyword index update failed")
+    return stored_ids

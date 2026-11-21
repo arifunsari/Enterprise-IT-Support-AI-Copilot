@@ -54,20 +54,21 @@ measured quality or cost targets are **Not found in codebase**.
 6. The API writes an audit row and returns the answer, source, trace, citations,
    and rewritten query.
 7. An authorized operator uploads a supported document through `POST
-   /api/ingest`; the API loads, chunks, embeds, and adds it to Pinecone.
+   /api/ingest`; the API validates, loads, chunks, embeds, and indexes it in
+   Pinecone and the local FTS5 store.
 
 ### Features and non-functional behavior
 
 | Area | Implemented behavior |
 |---|---|
-| Chat | Synchronous request/response; question length 2-3000 characters. |
-| Retrieval | Pinecone vector search with configured namespace and `top_k`. |
+| Chat | JSON request/response on `/api/chat`; token-level SSE on `/api/chat/stream`; question length 2-3000 characters. |
+| Retrieval | Pinecone dense candidates plus local SQLite FTS5 keyword candidates, reciprocal-rank fusion, and lexical reranking; final count is `TOP_K`. |
 | Web | Tavily fallback; up to five results are requested. |
-| Ingestion | Local upload copy plus Pinecone vector insertion. |
-| Audit | Local SQLite table; chat question, source, trace, UTC timestamp. |
+| Ingestion | Local upload copy, Pinecone vector insertion, and local FTS5 indexing. |
+| Audit | Local SQLite tables for chat audits and document ingestion metadata/FTS chunks. |
 | UI | Static HTML/CSS/JavaScript served by FastAPI. |
 | Availability, latency, throughput targets | Not found in codebase. |
-| Rate limiting, background execution, streaming | Not found in codebase. |
+| Rate limiting and background execution | Not found in codebase. |
 
 ## 3. System context
 
@@ -79,15 +80,18 @@ flowchart LR
     OpenAI[OpenAI API: chat and embeddings]
     Pinecone[Pinecone serverless index]
     Tavily[Tavily Search API]
-    SQLite[(Local SQLite audit database)]
+    SQLite[(Local SQLite audit, ingestion metadata, and FTS5 index)]
+    Langfuse[Optional Langfuse tracing]
     Files[(Local upload and sample files)]
 
-    Employee -->|GET UI; POST /api/chat| App
+    Employee -->|GET UI; POST /api/chat/stream| App
+    Employee -->|JSON POST /api/chat| App
     Admin -->|POST /api/ingest + X-Admin-Key| App
     App -->|chat / embedding requests| OpenAI
     App -->|vector query and upsert| Pinecone
     App -->|fallback search| Tavily
-    App -->|audit insert| SQLite
+    App -->|audit, status, and keyword index| SQLite
+    App -->|optional LangGraph callbacks| Langfuse
     App -->|write uploaded file; read sample KB| Files
 ```
 
@@ -349,7 +353,8 @@ the filename, chunk count, and generated IDs.
 |---|---|---|---|---|
 | `GET /api/health` | None | None | 200 status and service name | No dependency health checks. |
 | `POST /api/chat` | None | JSON `{"question": string}` | 200 answer, source, trace, citations, rewritten query | Pydantic validation 422; caught workflow/audit errors 500. |
-| `POST /api/ingest` | Shared `X-Admin-Key` | Multipart `file` | 200 message, filename, chunks, IDs | Invalid key 401; unsupported extension 400; missing file/schema 422; downstream errors are not explicitly translated. |
+| `POST /api/chat/stream` | None | JSON `{"question": string}` | SSE token events followed by completion metadata | Workflow errors are logged and returned as a generic SSE error event. |
+| `POST /api/ingest` | Shared `X-Admin-Key` | Multipart `file` | 200 document ID, status, chunks, IDs, duplicate flag | Invalid key 401; unsupported extension 415; empty file 400; oversized 413; invalid content 422; duplicate in progress 409; vector failure 502. |
 | `GET /` | None | Browser request | HTML from `templates/index.html` | Template/static configuration. |
 
 No versioned API prefix beyond `/api`, custom OpenAPI response schemas, request
@@ -362,8 +367,11 @@ flowchart LR
     Q[Browser question] --> V[ChatRequest validation]
     V --> R[LangGraph routing]
     R -->|IT support| E[OpenAI query embedding]
-    E --> S[Pinecone top-k search]
-    S --> K[Evidence grading]
+    E --> S[Pinecone dense candidates]
+    Q --> F[SQLite FTS5 keywords]
+    S --> HF[Reciprocal-rank fusion and lexical reranking]
+    F --> HF
+    HF --> K[Evidence grading]
     K -->|weak| T[Tavily web search and grading]
     T -->|weak and retry available| RW[Rewrite query]
     RW --> E
@@ -374,13 +382,15 @@ flowchart LR
     AW --> O
     AD --> O
     O --> AU[(SQLite audit: question/source/trace)]
+    O -->|SSE token chunks or JSON| Browser
 ```
 
 For ingestion, uploaded bytes are written to local disk, parsed into LangChain
 `Document` objects, split into 900-character chunks with 120-character
 overlap and start-index metadata, embedded through `OpenAIEmbeddings`, then
-stored in the configured Pinecone namespace. Source paths are carried as
-document metadata where loaders provide them. No explicit data encryption,
+stored in the configured Pinecone namespace and local FTS5 index. Source paths
+are carried as document metadata where loaders provide them; API citations expose
+only basenames. No explicit data encryption,
 retention, deletion, or vector re-index workflow is implemented.
 
 ## 10. Runtime flow analysis
@@ -421,10 +431,7 @@ sequenceDiagram
     C-->>W: Parsed decision, grade, rewrite, or answer
 ```
 
-The README's older references to Groq as the chat provider and HuggingFace
-embeddings do not match current runtime imports. `langchain-groq`,
-`langchain-huggingface`, and `sentence-transformers` appear in
-`requirements.txt`, but no runtime imports of those providers were found.
+The runtime uses OpenAI for chat and embeddings. Unused Groq, HuggingFace, sentence-transformers, and other unreferenced packages were removed from `requirements.txt`. Langfuse is an optional, explicitly enabled callback integration.
 
 ## 12. RAG architecture
 
@@ -432,19 +439,21 @@ embeddings do not match current runtime imports. `langchain-groq`,
 
 ```mermaid
 flowchart LR
-    U[Upload or sample file] --> S[Suffix validation for API uploads]
+    U[Upload or sample file] --> S[Extension, size, and content validation]
     S --> L[PDF/TXT/MD/DOCX loader]
     L --> D[LangChain Documents and metadata]
     D --> C[Recursive splitter: 900 / overlap 120]
     C --> E[OpenAI embeddings]
     E --> P[Pinecone serverless index and namespace]
+    C --> F[SQLite FTS5 chunk index]
 ```
 
 `PyPDFLoader` loads PDFs; `TextLoader` loads TXT/MD as UTF-8; `python-docx`
 extracts non-empty paragraphs. The API accepts only the listed suffixes; the
 sample script iterates every file in `sample_kb_dir` without an extension
-filter. OCR, table extraction, document malware scanning, deduplication, and
-metadata schema enforcement are **Not found in codebase**.
+filter. Uploads use SHA256-based duplicate detection, stable IDs, and SQLite
+ingestion states. OCR, table extraction, malware scanning, and a formal metadata
+schema remain absent.
 
 The configured embedding model defaults to `text-embedding-3-small`; the
 dimension table maps it to 1536. `ensure_index()` creates a missing cosine
@@ -457,8 +466,11 @@ of deleting/recreating the existing index.
 ```mermaid
 flowchart LR
     Q[Question/current query] --> E[OpenAI embedding via PineconeVectorStore]
-    E --> V[Pinecone vector search: namespace, top_k]
-    V --> G[LLM evidence grade]
+    E --> V[Pinecone dense candidate search]
+    Q --> F[SQLite FTS5 keyword search]
+    V --> R[Reciprocal-rank fusion + lexical reranking]
+    F --> R
+    R --> G[LLM evidence grade]
     G -->|good| A[Answer from private KB]
     G -->|weak| W[Tavily fallback]
     W --> WG[Web evidence grade]
@@ -467,9 +479,7 @@ flowchart LR
     WG -->|weak and no retries| I[Insufficient-evidence answer]
 ```
 
-An explicit reranker, hybrid keyword search, query filters, access-control
-metadata filters, conversation history, and long-term memory are **Not found in
-codebase**. Retrieval uses `top_k` (default 4) and the configured namespace.
+Retrieval fetches up to `RETRIEVAL_CANDIDATE_K` dense candidates from Pinecone and local keyword candidates from SQLite FTS5. Reciprocal rank fusion combines the lists; a lightweight lexical relevance pass ranks the fused candidates before returning `TOP_K` documents. The FTS5 table is populated when documents are inserted. Previously indexed uploads are backfilled when an identical file is uploaded again. This is local keyword retrieval, not Pinecone-native sparse-vector search. Query filters, access-control metadata filters, conversation history, and long-term memory remain absent.
 
 ## 13. Agent architecture
 
@@ -592,7 +602,7 @@ file values. Values below are code defaults, not secret values.
 | Variable | Code default | Required / impact if missing | Security / operational note |
 |---|---|---|---|
 | `APP_NAME` | `Enterprise IT Support Agentic RAG Copilot` | Optional; health/UI label. | Non-secret. |
-| `APP_ENV` | `development` | Optional; currently not used for behavior selection. | No environment-specific hardening found. |
+| `APP_ENV` | `development` | Production requires an admin key of at least 32 characters. | Controls production secret validation. |
 | `OPENAI_API_KEY` | Empty | Required for chat and embeddings; missing key raises runtime error when client is requested. | Secret; never commit or log. |
 | `TAVILY_API_KEY` | Empty | Required only when web fallback is used. | Secret. |
 | `PINECONE_API_KEY` | Empty | Required for index/retrieval/vector insertion. | Secret. |
@@ -600,18 +610,21 @@ file values. Values below are code defaults, not secret values.
 | `PINECONE_NAMESPACE` | `langgraph-agentic-rag` | Optional; mismatched namespace appears empty to retrieval. | Logical data partition only; not user authorization. |
 | `EMBEDDING_MODEL` | `text-embedding-3-small` | Required for dimension selection and embedding client configuration. | Dimension must match index. |
 | `OPENAI_MODEL` | `gpt-4o-mini` | Needed for LLM calls. | Provider-side model availability/cost applies. |
-| `TOP_K` | `4` | Optional; controls retrieval count. | No bounds validation found. |
+| `TOP_K` | `4` | Optional; controls final retrieval count. | Must be positive and no greater than `RETRIEVAL_CANDIDATE_K`. |
 | `MAX_RETRIES` | `1` | Optional; controls workflow retry. | No bounds validation found. |
-| `ADMIN_API_KEY` | `change-me` | Must be overridden for a protected ingestion endpoint. | Insecure default; shared static secret, direct comparison. |
+| `ADMIN_API_KEY` | Empty | Enables ingestion in development; required with 32+ characters in production. | Constant-time comparison; never log or commit. |
 | `AUDIT_DB_PATH` | `data/audit.db` | Optional; parent directory must be writable. | Audit data may contain sensitive questions. |
 | `UPLOAD_DIR` | `uploads` | Optional; must be writable. | Stores uploaded originals without cleanup. |
 | `SAMPLE_KB_DIR` | `data/sample_kb` | Used by manual sample ingestion script. | Missing directory causes script failure. |
+| `MAX_UPLOAD_SIZE_BYTES` | `10485760` | Maximum uploaded file size. | Enforced while reading upload chunks. |
+| `HYBRID_RETRIEVAL_ENABLED` | `true` | Uses FTS5 and Pinecone retrieval when enabled. | Existing Pinecone-only docs need local FTS backfill. |
+| `RETRIEVAL_CANDIDATE_K` | `12` | Candidate count before fusion/reranking. | Must be at least `TOP_K`. |
+| `LANGFUSE_ENABLED` | `false` | Enables optional LangGraph callback tracing. | Traces may contain prompt and retrieved document text. |
+| `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY` | Empty | Required when tracing is enabled. | Store as secrets. |
+| `LANGFUSE_BASE_URL` | SDK default | Optional Langfuse regional or self-hosted endpoint. | Check data residency. |
 | `HOST`, `PORT` | `127.0.0.1`, `8000` in `run.py`; Docker uses port 8080 | Optional listener settings. | Local runner binds loopback by default; container binds all interfaces. |
 
-No feature flag framework, secret manager integration, schema validation for
-deployment environments, or checked-in `.env.example` is found. The
-`requirements.txt`/README examples should be reconciled with the actual code
-defaults before using them as deployment configuration.
+There is no secret-manager integration. Langfuse tracing is opt-in and disabled by default; when enabled it can export prompts and retrieved evidence to the configured Langfuse project.
 
 ## 19. Security architecture and threat model
 
@@ -624,26 +637,25 @@ defaults before using them as deployment configuration.
 - Frontend text is HTML-escaped before insertion, and citation links use
   `rel="noopener"`.
 - SQLite audit values use parameterized SQL.
-- Private-KB and web-answer prompts instruct the model to ground answers in the
-  supplied evidence.
+- Retrieved private and web evidence is delimited as untrusted data in grading and
+  answer prompts; this is a safeguard, not a complete prompt-injection defense.
 
 ### Threats and gaps
 
 | Threat | Current evidence / gap | Recommended mitigation |
 |---|---|---|
-| Unauthorized ingestion | Shared `X-Admin-Key`; default is `change-me`; ordinary string comparison; no identity/RBAC. | Require high-entropy secret, rotate it, use constant-time comparison or identity provider, restrict endpoint at network layer. |
-| Secret exposure | `.env` ignored by Git, but Dockerfile copies build context and no `.dockerignore` is tracked. | Add `.dockerignore`; inject secrets at runtime using a secret manager; scan image and repository. |
-| Upload abuse / denial of service | Full file read/write, no size/page/chunk limits, content checks, or request throttling. | Enforce request/body/page/chunk limits, validate file signatures, scan files, rate-limit, isolate parsing. |
-| Path and file overwrite | Basename prevents directory traversal, but repeated names overwrite the local file. | Use generated storage names and safe retention policy. |
-| Prompt injection / poisoned KB | Retrieved text is inserted into prompts; no trust labeling or injection detector. | Treat retrieved/web text as untrusted data; test adversarial documents; require source policy and human review. |
-| Data leakage | Chat handler returns exception text; audit stores raw question and trace; no retention controls. | Return generic external errors, sanitize logs, define retention and access controls. |
+| Unauthorized ingestion | Shared `X-Admin-Key`; production requires 32+ characters and comparison is constant-time; no identity/RBAC. | Rotate secrets and use an identity provider/network restriction for multi-user production. |
+| Secret exposure | `.env` is excluded by `.gitignore` and `.dockerignore`; credentials were previously found in a utility script and should be revoked. | Keep secrets in runtime secret storage and scan future changes. |
+| Upload abuse / denial of service | Upload size and content are checked; request-level throttling, PDF page limits, and malware scanning are absent. | Add gateway rate limits, parser isolation, and malware scanning for production. |
+| Path and file overwrite | Generated filenames and exclusive creation prevent client path traversal and overwrite. | Define a retention and deletion policy for retained uploaded files. |
+| Prompt injection / poisoned KB | Retrieved text is labeled untrusted in grading and answer prompts; no guarantee can eliminate model susceptibility. | Continue adversarial testing and apply source policy and human review. |
+| Data leakage | Client errors are generic; audit retains raw questions/traces; optional Langfuse may export prompts and retrieved text. | Define audit/tracing retention and restrict Langfuse project access/data region. |
 | SSRF | No arbitrary-URL fetch endpoint found; web search uses Tavily. | Maintain egress allowlists and avoid adding arbitrary URL loaders without controls. |
 | SQL injection | Audit inserts are parameterized; no dynamic SQL found. | Preserve parameterization. |
 | Transport / browser security | Local README uses HTTP; TLS, CSP, CSRF controls, CORS policy, and security headers not found. | Terminate TLS at a trusted proxy; set security headers and deployment-specific CORS/CSRF policy. |
 | Model abuse / cost exhaustion | No auth on chat, rate limits, quotas, or token budgets found. | Add user auth, request quotas, token/context budgets, and provider spend alerts. |
 
-No formal threat model, security tests, RBAC, enterprise identity integration, or
-compliance controls are found.
+No RBAC, enterprise identity integration, retention controls, or compliance certification is implemented.
 
 ```mermaid
 flowchart LR
@@ -814,28 +826,20 @@ and limited automated tests.
 
 ## 29. Testing architecture
 
-The current workspace contains `tests/test_vectorstore.py` with two unit tests:
-index creation and connection under mocked Pinecone calls, and preservation of
-an existing index when dimensions mismatch. No end-to-end, browser, contract,
-load, security, or provider integration tests are found in the repository
-inventory. The README mentions a `tests/test_ingestion.py` file, but that file
-is not present in the current inventory.
-
-Recommended next coverage: API validation/auth/upload tests; file-loader and
-chunking tests; graph branch tests with mocked LLM/retriever/search; audit
-schema/insert tests; deployment smoke test for `/api/health`; prompt injection,
-upload-limit, and failure-path tests.
+The repository includes vectorstore tests, ingestion format tests, and security/API tests. `data/evaluations/stage2.jsonl` supplies expected-source and expected-term fixtures, and `python -m app.evaluation` executes them against live providers and reports source accuracy, expected-term recall, citation rate, and latency. The harness is a small regression set, not a statistically representative benchmark. No load or browser automation tests are included.
 
 ## 30. Data lineage
 
 | Data | Source | Transformations | Storage / destination | Consumer |
 |---|---|---|---|---|
 | Sample knowledge | `data/sample_kb/` files | Loader, chunker, OpenAI embedding | Pinecone namespace | Retrieval and answer generation |
-| Uploaded knowledge | Browser multipart file | Suffix check, local save, loader, chunker, embedding | `uploads/` and Pinecone | Retrieval and answer generation |
+| Uploaded knowledge | Browser multipart file | Extension/content validation, local save, loader, chunker, embedding, FTS indexing | `uploads/`, Pinecone, SQLite FTS5 | Retrieval and answer generation |
 | User question | Browser JSON | Pydantic validation, route/grade/rewrite prompts | External providers; question/source/trace in SQLite | Chat answer and audit |
 | Web results | Tavily response | Flattened result text and citation metadata | In-memory graph state | Grading and web answer |
 | Agent trace | Graph nodes | Append human-readable trace strings | Browser response and SQLite JSON | User transparency and audit |
-| Generated answer | OpenAI response | Returned in API/UI | Response only; not written to audit DB | Employee |
+| Generated answer | OpenAI response | Returned in JSON or SSE events | Response only; not written to audit DB | Employee |
+| Evaluation results | `data/evaluations/*.jsonl` | Source and expected-term metrics plus latency | Console or optional JSON report path | Developer regression review |
+| LLM traces | LangGraph callback events | Optional Langfuse tracing | Configured Langfuse service | Developer observability; disabled by default |
 
 Retention, deletion propagation from Pinecone, and personal-data classification
 are **Not found in codebase**.
@@ -851,9 +855,9 @@ from a separate approved requirements artifact.
 | Use current public information when private evidence is weak | Chat fallback | `search_web`, grader -> Tavily/OpenAI | No web response persistence | No workflow test found. |
 | Avoid unsupported answers | Evidence grading and insufficient node | `EvidenceGrade`, OpenAI | Trace audit only | No grading tests found. |
 | Improve weak retrieval query | Rewrite/retry branch | `rewrite_query` -> graph -> OpenAI | In-memory state | No retry test found. |
-| Let authorized staff add company files | `POST /api/ingest` | Ingestion service -> embeddings -> Pinecone | Local upload and vectors | No ingest endpoint test found. |
+| Let authorized staff add company files | `POST /api/ingest` | Ingestion service -> embeddings -> Pinecone/FTS5 | Local uploads, vectors, document status | `tests/test_security.py` exercises mocked upload and ingestion failures. |
 | Expose service health | `GET /api/health` | FastAPI handler | None | No health test found. |
-| Retain basic support trace | Chat route | Audit service -> SQLite | `query_audit` | No audit test found. |
+| Retain basic support trace | Chat route | Audit service -> SQLite | `query_audit` and ingestion metadata | Security tests cover status persistence. |
 
 There is no repository layer between routes/services and persistence; database
 traceability is direct to SQLite or Pinecone.
@@ -868,8 +872,11 @@ decisions; rationale/alternatives are not recorded in code.
 | LangGraph state machine | Control route/retrieve/grade/fallback/retry decisions. | More calls/state complexity than a single retrieve-and-generate chain. |
 | Private KB before web | Prefer company-specific knowledge and limit unnecessary public search. | Weak evidence adds latency and provider cost. |
 | Pinecone serverless, cosine, AWS `us-east-1` | Managed vector search with configured embedding vectors. | Region/index provisioning and cost controls remain operator concerns. |
-| OpenAI chat and embeddings | Shared provider for reasoning and vectorization. | Provider dependency; README still has older Groq/HuggingFace references. |
-| SQLite audit | Minimal local persistence for question/source/trace. | Single-host local durability/scaling limitations. |
+| Hybrid retrieval and lexical reranking | Add keyword recall while keeping Pinecone dense search. | Local FTS index must be present; reranker is lexical, not a cross-encoder. |
+| Langfuse callback | Optional graph tracing when configured. | Sends prompts and retrieved content to external Langfuse; opt-in and data-region dependent. |
+| SSE chat route | Token output through the existing graph. | Requires provider streaming support; JSON chat endpoint remains for compatibility. |
+| OpenAI chat and embeddings | Shared provider for reasoning and vectorization. | Provider dependency and cost. |
+| SQLite audit, ingestion state, and FTS5 | Minimal local persistence for traces, document hashes/statuses, and keyword search. | Single-host local durability/scaling limitations. |
 | Inline prompts and environment settings | Keep current demo implementation simple. | No prompt versioning or per-environment schema enforcement. |
 
 ## 33. Production readiness assessment

@@ -1,0 +1,6 @@
+{"id":"vpn-connect","question":"How do I connect to the company VPN from home?","expected_source":"private_kb","expected_terms":["NovaSecure","MFA","gateway"]}
+{"id":"password-reset","question":"What is the minimum password length and what happens after repeated failed logins?","expected_source":"private_kb","expected_terms":["14 characters","five","identity portal"]}
+{"id":"mfa-methods","question":"Which MFA methods are approved for protected company systems?","expected_source":"private_kb","expected_terms":["authenticator app","hardware security keys"]}
+{"id":"lost-laptop","question":"What should I do if my company laptop is stolen?","expected_source":"private_kb","expected_terms":["IT Service Desk","manager","asset tag"]}
+{"id":"software-install","question":"Where should I install business software from?","expected_source":"private_kb","expected_terms":["Software Portal"]}
+{"id":"greeting","question":"Hello!","expected_source":"direct","expected_terms":[]}
